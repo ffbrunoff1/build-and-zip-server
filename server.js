@@ -2,29 +2,26 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import fs from 'fs';
-import path from 'path';
-import { spawn } from 'child_process';
-import { nanoid } from 'nanoid';
-import { fileURLToPath } from 'url';
-import winston from 'winston';
 import Joi from 'joi';
+import winston from 'winston';
+import { nanoid } from 'nanoid';
 import archiver from 'archiver';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import path from 'path';
+import { promises as fs } from 'fs';
+import { createWriteStream } from 'fs';
+import { spawn } from 'child_process';
 
 // Configuração
 const config = {
-  port: process.env.PORT || 10000,
-  tempDir: path.join(__dirname, 'temp'),
-  logsDir: path.join(__dirname, 'logs'),
-  maxFileSize: '50mb',
+  port: process.env.PORT || 3000,
+  tempDir: path.join(process.cwd(), 'temp'),
+  logsDir: path.join(process.cwd(), 'logs'),
   buildTimeout: 300000, // 5 minutos
-  cleanupInterval: 1800000, // 30 minutos
-  maxTempAge: 3600000 // 1 hora
+  maxFileSize: 10 * 1024 * 1024, // 10MB por arquivo
+  maxFiles: 100
 };
 
-// Logger
+// Configuração do logger
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -32,7 +29,7 @@ const logger = winston.createLogger({
     winston.format.errors({ stack: true }),
     winston.format.json()
   ),
-  defaultMeta: { service: 'netlify-deploy-server' },
+  defaultMeta: { service: 'build-and-zip-server' },
   transports: [
     new winston.transports.File({ filename: path.join(config.logsDir, 'error.log'), level: 'error' }),
     new winston.transports.File({ filename: path.join(config.logsDir, 'combined.log') }),
@@ -43,28 +40,20 @@ const logger = winston.createLogger({
 });
 
 // Criar diretórios necessários
-await fs.promises.mkdir(config.tempDir, { recursive: true });
-await fs.promises.mkdir(config.logsDir, { recursive: true });
+await fs.mkdir(config.tempDir, { recursive: true });
+await fs.mkdir(config.logsDir, { recursive: true });
 
 const app = express();
 
-// Configurar trust proxy
-app.set('trust proxy', 1);
-
-// Middleware
-app.use(express.json({ limit: config.maxFileSize }));
-app.use(express.urlencoded({ limit: config.maxFileSize, extended: true }));
-
+// Lista de origens permitidas
 const allowedOrigins = [
   'https://lovableproject.com',
   'http://localhost:3000',
   'http://localhost:5173'
-  // Adicione aqui a URL exata do seu ambiente de preview, se for fixa.
-  // Ex: 'https://afdd7aeb-a01f-470a-a013-1e29dda9c6c1.lovableproject.com'
 ];
 
 const corsOptions = {
-  origin: function (origin, callback ) {
+  origin: function (origin, callback) {
     // Permite requisições sem 'origin' (ex: Postman, curl)
     if (!origin) return callback(null, true);
 
@@ -74,8 +63,7 @@ const corsOptions = {
     }
 
     // Lógica para permitir subdomínios de lovableproject.com
-    // Isso cobre 'https://qualquer-coisa.lovableproject.com'
-    const isLovableSubdomain = /^https:\/\/[a-z0-9-]+\.lovableproject\.com$/.test(origin );
+    const isLovableSubdomain = /^https:\/\/[a-z0-9-]+\.lovableproject\.com$/.test(origin);
     if (isLovableSubdomain) {
       return callback(null, true);
     }
@@ -87,58 +75,54 @@ const corsOptions = {
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 204 // Retorna 204 para preflight, é mais moderno e evita problemas
+  optionsSuccessStatus: 204
 };
 
 // Aplica o middleware CORS com as opções configuradas
 app.use(cors(corsOptions));
 
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false
-}));
+// Middlewares de segurança
+app.use(helmet());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 50, // máximo 50 requests por IP por janela
-  message: 'Muitas requisições deste IP, tente novamente em 15 minutos.',
+  max: 10, // máximo 10 requisições por IP por janela de tempo
+  message: { error: 'Muitas requisições. Tente novamente em 15 minutos.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use(limiter);
+
+app.use('/build-and-download', limiter);
 
 // Middleware de logging
 app.use((req, res, next) => {
-  if (req.path !== '/health') {
-    logger.info(`${req.method} ${req.path}`, {
-      ip: req.ip,
-      userAgent: req.get('User-Agent')
-    });
-  }
+  logger.info(`${req.method} ${req.path}`, {
+    ip: req.ip,
+    userAgent: req.get('User-Agent')
+  });
   next();
 });
 
-// Esquema de validação
-const deployRequestSchema = Joi.object({
+// Schema de validação
+const buildRequestSchema = Joi.object({
   files: Joi.object().pattern(
     Joi.string(),
-    Joi.string().allow('')
-  ).required(),
-  siteName: Joi.string().optional()
+    Joi.string().max(config.maxFileSize)
+  ).max(config.maxFiles).required()
 });
 
-// Função para executar comandos (VERSÃO FINAL E CORRETA)
+// Função para executar comandos
 const executeCommand = (command, args, cwd, timeout = config.buildTimeout) => {
   return new Promise((resolve, reject) => {
     const fullCommand = `${command} ${args.join(' ')}`;
     logger.info(`Executando comando: ${fullCommand}`, { cwd });
 
-    // AQUI ESTÁ A CORREÇÃO: shell: true é NECESSÁRIO.
-    // O comando completo é passado como primeiro argumento.
     const process = spawn(fullCommand, [], { 
       cwd, 
-      shell: true, // ESSENCIAL PARA O AMBIENTE DO RENDER ENCONTRAR O VITE
+      shell: true,
       stdio: 'pipe'
     });
     
@@ -177,18 +161,10 @@ const executeCommand = (command, args, cwd, timeout = config.buildTimeout) => {
   });
 };
 
-// Função para instalar dependências (VERSÃO CORRETA E MAIS SEGURA)
+// Função para instalar dependências
 const installDependencies = async (projectDir) => {
   logger.info('Instalando TODAS as dependências (incluindo dev)', { projectDir });
 
-  // A forma mais segura de garantir que devDependencies sejam instaladas
-  // é setar o NODE_ENV para 'development' temporariamente para o comando.
-  // No entanto, o spawn do Node não tem uma forma fácil de fazer isso cross-platform.
-  // A flag do npm é a melhor abordagem. A flag correta é --omit=dev (para omitir)
-  // então para incluir, nós simplesmente não a usamos e garantimos que NODE_ENV não seja 'production'.
-  // A flag '--include=dev' é uma opção, mas a mais comum é controlar pelo NODE_ENV.
-
-  // Vamos tentar a abordagem mais explícita com a flag de produção desativada.
   try {
     await executeCommand('npm', ['install', '--include=dev'], projectDir);
     logger.info('Dependências instaladas com npm (incluindo dev)');
@@ -198,17 +174,16 @@ const installDependencies = async (projectDir) => {
   }
 };
 
-// Função para fazer o build (VERSÃO FINAL E À PROVA DE FALHAS)
+// Função para fazer o build
 const runBuild = async (projectDir) => {
   logger.info('Iniciando build com caminho explícito para o Vite', { projectDir });
 
-  // Caminho absoluto e explícito para o executável do Vite dentro do projeto temporário.
-  // Isso elimina qualquer dependência do PATH do sistema.
+  // Caminho absoluto e explícito para o executável do Vite dentro do projeto temporário
   const viteExecutablePath = path.join(projectDir, 'node_modules', '.bin', 'vite');
 
   try {
     // Verificar se o executável do Vite realmente existe após o 'npm install'
-    await fs.promises.access(viteExecutablePath);
+    await fs.access(viteExecutablePath);
     logger.info(`Executável do Vite encontrado em: ${viteExecutablePath}`);
   } catch (accessError) {
     logger.error('CRÍTICO: O executável do Vite não foi encontrado após a instalação das dependências.', {
@@ -219,8 +194,7 @@ const runBuild = async (projectDir) => {
   }
 
   try {
-    // Executar o Vite DIRETAMENTE pelo seu caminho absoluto.
-    // O comando é o caminho para o vite, e o argumento é 'build'.
+    // Executar o Vite DIRETAMENTE pelo seu caminho absoluto
     await executeCommand(viteExecutablePath, ['build'], projectDir);
     logger.info('Build concluído com sucesso usando caminho explícito do Vite.');
   } catch (buildError) {
@@ -237,117 +211,48 @@ const createZipFromDist = (projectDir) => {
   return new Promise((resolve, reject) => {
     const distPath = path.join(projectDir, 'dist');
     const zipPath = path.join(projectDir, 'deploy.zip');
-    const output = fs.createWriteStream(zipPath);
+    
+    logger.info('Criando ZIP da pasta dist', { distPath, zipPath });
+    
+    const output = createWriteStream(zipPath);
     const archive = archiver('zip', { zlib: { level: 9 } });
-
+    
     output.on('close', () => {
-      logger.info(`ZIP criado com sucesso: ${zipPath} (${archive.pointer()} bytes)`);
+      const sizeInBytes = archive.pointer();
+      logger.info(`ZIP criado com sucesso: ${zipPath} (${sizeInBytes} bytes)`);
       resolve(zipPath);
     });
-
+    
     archive.on('error', (err) => {
       logger.error('Erro ao criar ZIP', { error: err.message });
       reject(err);
     });
-
+    
     archive.pipe(output);
     archive.directory(distPath, false);
     archive.finalize();
   });
 };
 
-// Função para publicar na Netlify
-const publishToNetlify = async (zipPath, siteName = null) => {
-  const NETLIFY_TOKEN = process.env.NETLIFY_AUTH_TOKEN;
-  if (!NETLIFY_TOKEN) {
-    throw new Error('Token da Netlify não configurado no servidor. Configure a variável NETLIFY_AUTH_TOKEN.');
-  }
-
-  logger.info('Enviando para Netlify', { zipPath, siteName });
-
-  try {
-    const zipBuffer = await fs.promises.readFile(zipPath);
-    
-    let apiUrl = 'https://api.netlify.com/api/v1/sites';
-    
-    if (siteName) {
-      apiUrl += `?name=${encodeURIComponent(siteName)}`;
-    }
-
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/zip',
-        'Authorization': `Bearer ${NETLIFY_TOKEN}`,
-      },
-      body: zipBuffer,
-    });
-
-    if (!response.ok) {
-      const errorData = await response.text();
-      logger.error('Erro no deploy da Netlify', { status: response.status, error: errorData });
-      throw new Error(`Erro no deploy da Netlify (${response.status}): ${errorData}`);
-    }
-
-    const deployData = await response.json();
-    logger.info('Deploy na Netlify bem-sucedido!', { 
-      url: deployData.ssl_url, 
-      siteId: deployData.site_id,
-      deployId: deployData.id 
-    });
-
-    return deployData;
-  } catch (error) {
-    logger.error('Falha ao publicar na Netlify', { error: error.message });
-    throw error;
-  }
-};
-
-// Função para limpar arquivos temporários antigos
-const cleanupOldFiles = async () => {
-  try {
-    const entries = await fs.promises.readdir(config.tempDir, { withFileTypes: true });
-    const now = Date.now();
-    
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const dirPath = path.join(config.tempDir, entry.name);
-        const stats = await fs.promises.stat(dirPath);
-        
-        if (now - stats.mtime.getTime() > config.maxTempAge) {
-          await fs.promises.rm(dirPath, { recursive: true, force: true });
-          logger.info(`Arquivo temporário removido: ${entry.name}`);
-        }
-      }
-    }
-  } catch (error) {
-    logger.error('Erro na limpeza de arquivos temporários', { error: error.message });
-  }
-};
-
-// ROTAS
-
 // Rota de saúde
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    service: 'netlify-deploy-server',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
+    service: 'build-and-zip-server'
   });
 });
 
-// Rota principal de deploy
-app.post('/deploy', async (req, res) => {
-  const deployId = nanoid();
-  const projectDir = path.join(config.tempDir, deployId);
+// Rota principal de build e download
+app.post('/build-and-download', async (req, res) => {
+  const buildId = nanoid();
+  const projectDir = path.join(config.tempDir, buildId);
   
-  logger.info('Requisição de deploy recebida', { deployId });
+  logger.info('Requisição de build e download recebida', { buildId });
   
   try {
     // Validar entrada
-    const { error, value } = deployRequestSchema.validate(req.body);
+    const { error, value } = buildRequestSchema.validate(req.body);
     if (error) {
       return res.status(400).json({ 
         error: 'Dados inválidos', 
@@ -355,29 +260,29 @@ app.post('/deploy', async (req, res) => {
       });
     }
     
-    const { files, siteName } = value;
-    const fileCount = Object.keys(files).length;
+    const { files } = value;
     
-    if (fileCount === 0) {
-      return res.status(400).json({ error: 'Nenhum arquivo fornecido' });
-    }
-    
-    logger.info('Criando projeto para deploy', { deployId, fileCount, siteName });
+    logger.info('Criando projeto para build', { 
+      buildId, 
+      fileCount: Object.keys(files).length 
+    });
     
     // Criar diretório do projeto
-    await fs.promises.mkdir(projectDir, { recursive: true });
+    await fs.mkdir(projectDir, { recursive: true });
     
     // Escrever arquivos
     await Promise.all(
       Object.entries(files).map(async ([filePath, content]) => {
-        const fullPath = path.join(projectDir, filePath);
+        const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
+        const fullPath = path.join(projectDir, cleanPath);
         const dir = path.dirname(fullPath);
-        await fs.promises.mkdir(dir, { recursive: true });
-        await fs.promises.writeFile(fullPath, content, 'utf8');
+        
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(fullPath, content, 'utf8');
       })
     );
     
-    logger.info('Arquivos escritos, iniciando build', { deployId });
+    logger.info('Arquivos escritos, iniciando build', { buildId });
     
     // Instalar dependências
     await installDependencies(projectDir);
@@ -390,7 +295,8 @@ app.post('/deploy', async (req, res) => {
     const indexPath = path.join(distPath, 'index.html');
     
     try {
-      await fs.promises.access(indexPath);
+      await fs.access(indexPath);
+      logger.info('Build verificado: index.html encontrado', { buildId });
     } catch {
       throw new Error('Build falhou: index.html não encontrado na pasta dist');
     }
@@ -398,69 +304,42 @@ app.post('/deploy', async (req, res) => {
     // Criar ZIP da pasta dist
     const zipPath = await createZipFromDist(projectDir);
     
-    // Publicar na Netlify
-    const deployData = await publishToNetlify(zipPath, siteName);
+    // Enviar o arquivo ZIP como resposta
+    logger.info(`Enviando arquivo ZIP para o cliente: ${zipPath}`, { buildId });
 
-    logger.info('RESPOSTA COMPLETA RECEBIDA DO NETLIFY:', { 
-      data: JSON.stringify(deployData, null, 2) 
-    });
-    
-    logger.info('Deploy concluído com sucesso', { 
-      deployId, 
-      netlifyUrl: deployData.ssl_url,
-      siteId: deployData.site_id 
-    });
-    
-    // Primeiro, vamos logar o que recebemos do Netlify para ter certeza
-logger.info('Dados recebidos do Netlify para montar a resposta:', { deployData });
+    const downloadFileName = `deploy-${buildId}.zip`;
 
-// Montamos a resposta final PLANA, sem o objeto "deploy" aninhado.
-res.json({
-  success: true,
-  message: 'Deploy concluído com sucesso na Netlify',
-  
-  // Os dados do deploy vão diretamente no corpo da resposta,
-  // exatamente como a função parseDeployResponse no frontend espera.
-  id: deployData.id || '',
-  deploy_id: deployData.deploy_id || '',
-  subdomain: deployData.subdomain || '',
-  url: deployData.url || '',
-  state: deployData.state || 'uploaded',
-  required: deployData.required || []
-});
+    res.download(zipPath, downloadFileName, (err) => {
+      if (err) {
+        logger.error('Erro ao enviar o arquivo ZIP para o cliente', { buildId, error: err.message });
+      } else {
+        logger.info(`Arquivo ZIP ${downloadFileName} enviado com sucesso.`, { buildId });
+      }
+
+      // Limpeza da pasta temporária após o envio
+      fs.rm(projectDir, { recursive: true, force: true })
+        .then(() => logger.info(`Pasta temporária de build removida: ${buildId}`))
+        .catch(cleanupError => logger.error('Erro na limpeza após download', { buildId, error: cleanupError.message }));
+    });
     
   } catch (error) {
-    logger.error('Erro no deploy', { deployId, error: error.message, stack: error.stack });
+    logger.error('Erro no processo de build e zip', { buildId, error: error.message, stack: error.stack });
     
+    // Se der erro ANTES do download, remove a pasta imediatamente
+    await fs.rm(projectDir, { recursive: true, force: true }).catch(() => {});
+
     res.status(500).json({
-      error: 'Falha no deploy',
+      error: 'Falha no processo de build',
       message: error.message,
-      deployId
+      buildId
     });
-  } finally {
-    // Limpar pasta temporária sempre (sucesso ou erro)
-    try {
-      await fs.promises.rm(projectDir, { recursive: true, force: true });
-      logger.info(`Pasta temporária de deploy removida: ${deployId}`);
-    } catch (cleanupError) {
-      logger.error('Erro na limpeza após deploy', { deployId, error: cleanupError.message });
-    }
   }
 });
 
 // Middleware de tratamento de erros
 app.use((error, req, res, next) => {
-  logger.error('Erro não tratado', { 
-    error: error.message, 
-    stack: error.stack,
-    url: req.url,
-    method: req.method
-  });
-  
-  res.status(500).json({
-    error: 'Erro interno do servidor',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Algo deu errado'
-  });
+  logger.error('Erro não tratado', { error: error.message, stack: error.stack });
+  res.status(500).json({ error: 'Erro interno do servidor' });
 });
 
 // Middleware para rotas não encontradas
@@ -468,40 +347,18 @@ app.use('*', (req, res) => {
   res.status(404).json({ error: 'Rota não encontrada' });
 });
 
-// Iniciar limpeza periódica
-setInterval(cleanupOldFiles, config.cleanupInterval);
-
 // Iniciar servidor
 app.listen(config.port, '0.0.0.0', () => {
-  logger.info(`Servidor de deploy Netlify iniciado`, { 
-    port: config.port,
-    nodeEnv: process.env.NODE_ENV,
-    tempDir: config.tempDir
-  });
-  
-  // Limpeza inicial
-  cleanupOldFiles();
+  logger.info(`Servidor de build e zip rodando na porta ${config.port}`);
 });
 
-// Tratamento de sinais de encerramento
+// Tratamento de sinais para encerramento gracioso
 process.on('SIGTERM', () => {
-  logger.info('Recebido SIGTERM, encerrando servidor...');
+  logger.info('SIGTERM recebido, encerrando servidor...');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  logger.info('Recebido SIGINT, encerrando servidor...');
+  logger.info('SIGINT recebido, encerrando servidor...');
   process.exit(0);
 });
-
-// Tratamento de erros não capturados
-process.on('uncaughtException', (error) => {
-  logger.error('Exceção não capturada', { error: error.message, stack: error.stack });
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Promise rejeitada não tratada', { reason, promise });
-  process.exit(1);
-});
-
