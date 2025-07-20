@@ -1,7 +1,7 @@
 {
-  "name": "netlify-deploy-server",
+  "name": "build-and-zip-server",
   "version": "1.0.0",
-  "description": "Servidor dedicado para deploy no Netlify",
+  "description": "Servidor para build e download de projetos como ZIP",
   "main": "server.js",
   "type": "module",
   "scripts": {
