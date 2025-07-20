@@ -1,0 +1,25 @@
+{
+  "name": "netlify-deploy-server",
+  "version": "1.0.0",
+  "description": "Servidor dedicado para deploy no Netlify",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^6.8.1",
+    "joi": "^17.9.2",
+    "winston": "^3.10.0",
+    "nanoid": "^4.0.2",
+    "archiver": "^6.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
