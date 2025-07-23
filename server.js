@@ -55,21 +55,24 @@ const allowedOrigins = [
 const corsOptions = {
   origin: function (origin, callback) {
     // Permite requisições sem 'origin' (ex: Postman, curl)
-    if (!origin) return callback(null, true);
+    if (!origin) {
+      return callback(null, true);
+    }
 
-    // Verifica se a origem está na lista de permitidas
+    // Verifica se a origem está na lista de permitidas estáticas
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    // Lógica para permitir subdomínios de lovableproject.com
-    const isLovableSubdomain = /^https:\/\/[a-z0-9-]+\.lovableproject\.com$/.test(origin);
-    if (isLovableSubdomain) {
+    // CORREÇÃO: Verifica se a origem é um subdomínio de 'lovable.app'
+    const lovableAppDomain = 'lovable.app';
+    if (origin.endsWith(`.${lovableAppDomain}`)) {
       return callback(null, true);
     }
 
-    // Se a origem não for permitida
-    const msg = 'A política de CORS para este site não permite acesso da origem especificada.';
+    // Se a origem não for permitida de forma alguma
+    const msg = `A política de CORS para este site não permite acesso da origem: ${origin}`;
+    logger.warn('Requisição de CORS bloqueada', { origin });
     return callback(new Error(msg), false);
   },
   methods: ['GET', 'POST', 'OPTIONS'],
